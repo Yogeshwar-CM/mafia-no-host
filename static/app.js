@@ -1,32 +1,66 @@
-/* The player's phone: private role, private night action, private results. */
+/* The player's phone: a private script. Role, night action, and the
+   detective's findings live here and nowhere else. */
 (() => {
   "use strict";
 
   const app = document.getElementById("app");
   const KEY = "mafia.token";
+
   let token = localStorage.getItem(KEY);
   let state = null;
   let error = "";
-  let roleVisible = false;
-  let clockOffset = 0;   // serverTime - localTime
+  let peeking = false;      // held, never toggled
+  let clockOffset = 0;      // serverTime - localTime
+  let lastScene = null;     // so title cards fire on change, not on every push
   let source = null;
 
-  const ROLE_BLURB = {
+  const BRIEF = {
     mafia: "Each night you and your partners choose someone to kill. By day, blend in.",
     detective: "Each night you may investigate one player and learn if they are mafia.",
-    doctor: "Each night you may protect one player. Never the same one twice in a row.",
+    doctor: "Each night you may protect one player. Never the same one twice running.",
     villager: "You have no night action. Your weapon is the vote.",
-  };
-
-  const PHASE_TITLE = {
-    lobby: "Gathering", night: "Night", day: "Discussion",
-    vote: "The vote", over: "Game over",
   };
 
   const esc = (s) => String(s).replace(/[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-  // ---------------------------------------------------------------- network
+  /* --- The performance ---------------------------------------------------
+     Every phase is an act with a name. The mood re-lights the whole room. */
+
+  function scene() {
+    const p = state.public;
+    const n = p.round;
+    switch (p.phase) {
+      case "lobby": return { mood: "ink", act: "The company", title: "Take your seats" };
+      case "night": return { mood: "ink", act: `Act ${n} · Night`, title: "The town sleeps" };
+      case "day": return { mood: "light", act: `Act ${n} · Morning`, title: "The town wakes" };
+      case "vote": return { mood: "light", act: `Act ${n} · The vote`, title: "The floor is open" };
+      case "over": return {
+        mood: "light", act: "Curtain",
+        title: p.winner === "mafia" ? "The mafia win" : "The town wins",
+      };
+      default: return { mood: "ink", act: "", title: "" };
+    }
+  }
+
+  function applyMood(mood) {
+    document.body.dataset.mood = mood;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", mood === "ink" ? "#0e1020" : "#efe7d6");
+  }
+
+  function titleCard(sc) {
+    const el = document.createElement("div");
+    el.className = "titlecard";
+    el.innerHTML =
+      `<div class="act">${esc(sc.act)}</div>
+       <h1 class="title">${esc(sc.title)}</h1>
+       <div class="ornament"><span>&#9670;</span></div>`;
+    document.body.appendChild(el);
+    el.addEventListener("animationend", () => el.remove());
+  }
+
+  /* --- Network ----------------------------------------------------------- */
 
   async function post(path, body) {
     const res = await fetch(path, {
@@ -35,7 +69,7 @@
       body: JSON.stringify(body || {}),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || "something went wrong");
+    if (!res.ok) throw new Error(data.error || "That did not work.");
     return data;
   }
 
@@ -51,235 +85,293 @@
     source.onmessage = (event) => {
       state = JSON.parse(event.data);
       clockOffset = state.server_time * 1000 - Date.now();
-      // Back in the lobby means a fresh deal is coming: re-hide the old secret.
-      if (state.public.phase === "lobby") roleVisible = false;
       render();
     };
-    source.onerror = () => { /* EventSource retries on its own */ };
   }
 
-  // ----------------------------------------------------------------- pieces
+  /* --- Pieces ------------------------------------------------------------ */
 
   function clock() {
     const deadline = state.public.deadline;
     if (!deadline) return "";
     const left = Math.max(0, Math.round(deadline - (Date.now() + clockOffset) / 1000));
-    const mm = String(Math.floor(left / 60)).padStart(1, "0");
     const ss = String(left % 60).padStart(2, "0");
-    return `<span class="clock ${left <= 10 ? "urgent" : ""}">${mm}:${ss}</span>`;
+    return `<div class="clock ${left <= 10 ? "urgent" : ""}">${Math.floor(left / 60)}:${ss}</div>`;
   }
 
-  function banner() {
-    const p = state.public;
-    const round = p.round ? `Night ${p.round}` : "";
-    return `<div class="card banner">
+  function topbar(sc) {
+    return `<div class="topbar">
       <div>
-        <div class="phase">${PHASE_TITLE[p.phase] || p.phase}</div>
-        <div class="muted small">${round} &middot; ${p.alive_count} alive</div>
+        <div class="act">${esc(sc.act)}</div>
+        <div class="small dim">${state.public.alive_count} still standing</div>
       </div>${clock()}</div>`;
   }
 
   function roleCard() {
     const me = state.private;
     if (!me.role) return "";
-    const body = `
-      <div class="role-name">${esc(me.role)}</div>
-      <p class="muted small">${ROLE_BLURB[me.role] || ""}</p>
-      ${me.partners && me.partners.length
-        ? `<p class="small">With you: ${me.partners.map((p) =>
-            `<span class="pill mafia">${esc(p.name)}${p.alive ? "" : " (dead)"}</span>`).join("")}</p>`
-        : ""}
-      ${me.role === "detective" && me.investigations
-        ? investigations(me.investigations) : ""}
-      ${me.alive ? "" : `<p class="small muted">You are out. Watch quietly — no talking.</p>`}`;
-
-    return `<div class="card role-card role-${esc(me.role)}">
-      ${body}
-      ${roleVisible ? "" : `<div class="veil" data-reveal>Tap to see your role</div>`}
+    return `<div class="card-hold role-${esc(me.role)} ${peeking ? "peeking" : ""}"
+                 tabindex="0" role="button" aria-label="Hold to see your role">
+      <div class="card-inner">
+        <div class="card-face card-back">
+          <div class="monogram">M</div>
+          <div class="instruction">Hold to look</div>
+        </div>
+        <div class="card-face card-front">
+          <div class="role">${esc(me.role)}</div>
+          <p class="brief">${esc(BRIEF[me.role] || "")}</p>
+          ${me.partners && me.partners.length
+            ? `<p class="small">Alongside you:
+                 ${me.partners.map((p) => esc(p.name) + (p.alive ? "" : " (dead)")).join(", ")}</p>`
+            : ""}
+        </div>
+      </div>
     </div>`;
   }
 
-  function investigations(notes) {
-    if (!notes.length) return `<p class="small muted">No investigations yet.</p>`;
-    return `<p class="small">Your findings: ${notes.map((n) =>
-      `<span class="pill ${n.is_mafia ? "mafia" : "clear"}">${esc(n.name)}: ${
-        n.is_mafia ? "MAFIA" : "not mafia"}</span>`).join("")}</p>`;
-  }
-
-  function lobby() {
-    const p = state.public;
-    const enough = p.players.length >= p.min_players;
-    return `<div class="card">
-      <h2>Players (${p.players.length})</h2>
-      <ul class="players">${p.players.map((x) =>
-        `<li><span class="dot ${x.connected ? "" : "off"}"></span>${esc(x.name)}
-         ${x.id === state.you ? '<span class="tag">you</span>' : ""}</li>`).join("")}</ul>
-      </div>
-      <div class="card">
-      ${state.is_host
-        ? `<button class="primary" data-act="start" ${enough ? "" : "disabled"}>
-             ${enough ? "Start the game" : `Need ${p.min_players - p.players.length} more`}
-           </button>
-           <p class="small muted center" style="margin-top:10px">
-             Roles are dealt at random. Nobody, including you, sees anyone else's.</p>`
-        : `<p class="center muted">Waiting for the host to start${enough ? "" : " — more players needed"}.</p>`}
-      </div>`;
+  function findings() {
+    const me = state.private;
+    if (me.role !== "detective") return "";
+    const notes = me.investigations || [];
+    return `<div class="panel">
+      <h2>Your findings</h2>
+      ${notes.length
+        ? notes.map((n) => `<span class="finding ${n.is_mafia ? "guilty" : "clear"}">
+             ${esc(n.name)} — ${n.is_mafia ? "mafia" : "not mafia"}</span>`).join("")
+        : `<p class="small dim">Nothing yet. You get one name a night.</p>`}
+    </div>`;
   }
 
   function nightPanel() {
     const me = state.private;
-    if (!me.alive) return `<div class="card"><p class="muted">The night passes without you.</p></div>`;
-    if (!me.action) {
-      return `<div class="card">
-        <h2>Sleep tight</h2>
-        <p class="muted">You have no night action. Wait for morning.</p></div>`;
+    if (!me.alive) {
+      return `<div class="panel"><h2>You are out</h2>
+        <p class="small dim">Watch, and say nothing.</p></div>`;
     }
+    if (!me.action) {
+      return `<div class="panel"><h2>You sleep</h2>
+        <p class="small dim">No night action. Wait for morning.</p></div>`;
+    }
+
     const verb = { kill: "Kill", investigate: "Investigate", protect: "Protect" }[me.action];
-    const chosen = me.submitted;
-    const buttons = (me.targets || []).map((t) =>
-      `<button data-target="${t.id}" class="${chosen === t.id ? "selected" : ""}">
+    const heading = {
+      kill: "Choose tonight's victim",
+      investigate: "Investigate one player",
+      protect: "Protect one player",
+    }[me.action];
+
+    const targets = (me.targets || []).map((t) =>
+      `<button data-target="${t.id}" class="${me.submitted === t.id ? "chosen" : ""}">
          ${verb} ${esc(t.name)}</button>`).join("");
 
     const skip = me.action === "kill" ? "" :
-      `<button data-target="none" class="ghost ${me.has_submitted && chosen === null ? "selected" : ""}">
+      `<button data-target="none"
+               class="quiet ${me.has_submitted && me.submitted === null ? "chosen" : ""}">
          Do nothing tonight</button>`;
 
-    const partnerVotes = me.partner_votes && me.partner_votes.length > 1
-      ? `<p class="small muted">Your side so far: ${me.partner_votes.map((v) =>
-          `${esc(v.voter)} &rarr; ${esc(v.target)}`).join(", ")}</p>` : "";
+    const partners = me.partner_votes && me.partner_votes.length > 1
+      ? `<p class="small dim" style="margin-top:12px">Your side so far —
+           ${me.partner_votes.map((v) => `${esc(v.voter)} picks ${esc(v.target)}`).join("; ")}</p>`
+      : "";
 
-    const noTargets = (me.targets || []).length === 0
-      ? `<p class="small muted">No legal target tonight.</p>` : "";
-
-    return `<div class="card">
-      <h2>${verb} someone</h2>
-      ${me.role === "doctor" && me.last_protected
-        ? `<p class="small muted">You protected someone last night — you cannot repeat them.</p>` : ""}
-      ${noTargets}${buttons}${skip}${partnerVotes}
-      <p class="small muted" style="margin-top:10px">You can change your mind until the night ends.</p>
+    return `<div class="panel">
+      <h2>${heading}</h2>
+      ${me.role === "doctor" && me.last_protected !== null && me.last_protected !== undefined
+        ? `<p class="small dim">You protected someone last night. Not them again.</p>` : ""}
+      ${targets || `<p class="small dim">No one you may choose tonight.</p>`}
+      ${skip}
+      ${partners}
     </div>`;
   }
 
   function dayPanel() {
     const me = state.private;
-    if (!me.alive) return `<div class="card"><p class="muted">You are dead. No talking.</p></div>`;
+    if (!me.alive) {
+      return `<div class="panel"><h2>You are out</h2>
+        <p class="small dim">No talking. Let them work it out.</p></div>`;
+    }
     const ready = (state.public.ready || []).includes(state.you);
-    const count = (state.public.ready || []).length;
-    return `<div class="card">
+    return `<div class="panel">
       <h2>Talk it out</h2>
-      <p class="muted small">Accuse, defend, lie. The vote opens when everyone is ready
-        or the clock runs out.</p>
-      <button class="${ready ? "selected" : "primary"}" data-act="ready" data-ready="${ready ? "0" : "1"}">
-        ${ready ? "Ready — tap to undo" : "I'm ready to vote"}</button>
-      <p class="small muted center" style="margin-top:10px">
-        ${count} of ${state.public.alive_count} ready</p>
+      <p class="small dim">Accuse, defend, lie. The vote opens when everyone is ready.</p>
+      <button class="${ready ? "chosen" : "primary"}"
+              data-act="ready" data-ready="${ready ? "0" : "1"}">
+        ${ready ? "Ready — tap to take it back" : "I'm ready to vote"}</button>
+      <p class="small dim center" style="margin-top:12px">
+        ${(state.public.ready || []).length} of ${state.public.alive_count} ready</p>
     </div>`;
   }
 
   function votePanel() {
     const me = state.private;
-    if (!me.alive) return `<div class="card"><p class="muted">The dead do not vote.</p></div>`;
-    const chosen = me.submitted_vote;
+    if (!me.alive) {
+      return `<div class="panel"><h2>You are out</h2>
+        <p class="small dim">The dead do not vote.</p></div>`;
+    }
     const alive = state.public.players.filter((p) => p.alive);
-    const buttons = alive.map((p) =>
-      `<button data-vote="${p.id}" class="${chosen === p.id ? "selected" : ""}">
-         Vote out ${esc(p.name)}${p.id === state.you ? " (you)" : ""}</button>`).join("");
-    return `<div class="card">
+    return `<div class="panel">
       <h2>Who goes?</h2>
-      ${buttons}
-      <button class="ghost ${chosen === null ? "selected" : ""}" data-vote="none">Abstain</button>
-      <p class="small muted" style="margin-top:10px">
-        A tie eliminates nobody. ${(state.public.voted || []).length} of
+      ${alive.map((p) => `<button data-vote="${p.id}"
+           class="${me.submitted_vote === p.id ? "chosen" : ""}">
+           Vote out ${esc(p.name)}${p.id === state.you ? " (you)" : ""}</button>`).join("")}
+      <button class="quiet ${me.submitted_vote === null ? "chosen" : ""}" data-vote="none">
+        Abstain</button>
+      <p class="small dim" style="margin-top:12px">
+        A tie sends no one home. ${(state.public.voted || []).length} of
         ${state.public.alive_count} have voted.</p>
     </div>`;
   }
 
-  function overPanel() {
+  function castList(revealAll) {
     const p = state.public;
-    const won = p.winner === "mafia" ? "The mafia win." : "The town wins.";
-    return `<div class="card center">
-      <h1>${won}</h1>
-      <ul class="players" style="text-align:left;margin-top:14px">
-        ${p.players.map((x) =>
-          `<li class="${x.alive ? "" : "dead"}">${esc(x.name)}
-           <span class="tag ${x.role === "mafia" ? "mafia" : ""}">${esc(x.role || "?")}</span></li>`).join("")}
-      </ul>
-      ${state.is_host ? `<button class="primary" data-act="reset" style="margin-top:14px">
-        Deal again, same players</button>` : `<p class="muted small" style="margin-top:12px">
-        Waiting for the host to deal again.</p>`}
-    </div>`;
+    return `<ul class="cast">${p.players.map((x) => {
+      let billing = "", cls = "";
+      if (x.role && (revealAll || !x.alive)) {
+        billing = x.role;
+        cls = x.role === "mafia" ? "blood" : "gilt";
+      } else if (!x.connected) {
+        billing = "away";
+      } else if (p.phase === "vote") {
+        billing = (p.voted || []).includes(x.id) ? "voted" : "";
+      } else if (p.phase === "day") {
+        billing = (p.ready || []).includes(x.id) ? "ready" : "";
+      }
+      if (x.id === state.you && !billing) billing = "you";
+      return `<li class="${x.alive ? "" : "gone"}">
+        <span class="name">${esc(x.name)}</span>
+        <span class="leaders"></span>
+        <span class="billing ${cls}">${esc(billing)}</span></li>`;
+    }).join("")}</ul>`;
   }
 
-  function logCard() {
-    const entries = state.public.log.slice(-12).reverse();
+  function directions() {
+    const entries = state.public.log.slice(-10).reverse();
     if (!entries.length) return "";
-    return `<div class="card"><h2>What happened</h2>
-      <ul class="log">${entries.map((e) =>
-        `<li><div class="round">${e.round ? `Round ${e.round}` : "Start"}</div>${esc(e.text)}</li>`
-      ).join("")}</ul></div>`;
+    return `<div class="panel"><h2>What happened</h2>
+      <ul class="directions">${entries.map((e) =>
+        `<li>${esc(e.text)}</li>`).join("")}</ul></div>`;
   }
 
-  function rosterCard() {
+  function lobbyPanel() {
     const p = state.public;
-    return `<div class="card"><h2>At the table</h2>
-      <ul class="players">${p.players.map((x) =>
-        `<li class="${x.alive ? "" : "dead"}">
-          <span class="dot ${x.connected ? "" : "off"}"></span>${esc(x.name)}
-          ${x.id === state.you ? '<span class="tag">you</span>' : ""}
-          ${!x.alive && x.role ? `<span class="tag ${x.role === "mafia" ? "mafia" : ""}">${esc(x.role)}</span>` : ""}
-        </li>`).join("")}</ul></div>`;
+    const short = p.min_players - p.players.length;
+    return `<div class="panel">
+      <h2>The company</h2>
+      ${castList(false)}
+      </div>
+      <div class="panel">
+      ${state.is_host
+        ? `<button class="primary" data-act="start" ${short > 0 ? "disabled" : ""}>
+             ${short > 0 ? `${short} more to start` : "Begin"}</button>
+           <p class="small dim center" style="margin-top:12px">
+             Roles are dealt at random. No one sees another's.</p>`
+        : `<p class="small dim center">Waiting for the host to begin${
+             short > 0 ? ` — ${short} more needed` : ""}.</p>`}
+      </div>`;
+  }
+
+  function curtainPanel() {
+    return `<div class="panel">
+      <h2>The company</h2>
+      <div class="ornament"><span>&#9670;</span></div>
+      ${castList(true)}
+      ${state.is_host
+        ? `<button class="primary" data-act="reset" style="margin-top:16px">Deal again</button>`
+        : `<p class="small dim center" style="margin-top:14px">
+             Waiting for the host to deal again.</p>`}
+    </div>`;
   }
 
   function joinScreen() {
     const open = !state || state.can_join;
-    return `<div class="card">
-      <h1>Mafia</h1>
-      <p class="muted">No host needed. This phone is your private screen —
+    return `<div class="panel">
+      <div class="act">A game for four or more</div>
+      <h1 class="title" style="font-size:2.4rem;margin:6px 0 4px">Mafia</h1>
+      <div class="ornament"><span>&#9670;</span></div>
+      <p class="small dim">No host needed. This phone is your private script —
         keep it to yourself.</p>
       ${open
-        ? `<input type="text" id="name" placeholder="Your name" maxlength="20" autocomplete="off">
-           <button class="primary" data-act="join">Join the table</button>`
-        : `<p class="notice">A game is already in progress. You can watch the shared
-           screen and join the next one.</p>`}
+        ? `<input type="text" id="name" placeholder="Your name" maxlength="20"
+                  autocomplete="off" enterkeyhint="go">
+           <button class="primary" data-act="join">Take a seat</button>`
+        : `<p class="notice">A game is already running. Watch the shared screen —
+             you can join the next one.</p>`}
     </div>`;
   }
 
-  // ----------------------------------------------------------------- render
+  /* --- Render ------------------------------------------------------------ */
 
   function render() {
-    if (!state) { app.innerHTML = `<div class="card"><p class="muted">Connecting…</p></div>`; return; }
-    document.body.dataset.phase = state.public.phase;
+    if (!state) {
+      app.innerHTML = `<div class="panel"><p class="dim">Connecting…</p></div>`;
+      return;
+    }
+
+    const sc = scene();
+    applyMood(sc.mood);
+    const key = `${state.public.phase}:${state.public.round}`;
+    if (lastScene !== null && lastScene !== key) titleCard(sc);
+    lastScene = key;
+
+    if (state.public.phase === "lobby") peeking = false;
+
+    const notice = error ? `<div class="notice">${esc(error)}</div>` : "";
 
     if (!state.you) {
-      app.innerHTML = (error ? `<div class="notice">${esc(error)}</div>` : "") +
-        joinScreen() + (state.public.players.length ? rosterCard() : "");
+      app.innerHTML = notice + joinScreen();
       return;
     }
 
     const phase = state.public.phase;
     let panel = "";
-    if (phase === "lobby") panel = lobby();
+    if (phase === "lobby") panel = lobbyPanel();
     else if (phase === "night") panel = nightPanel();
     else if (phase === "day") panel = dayPanel();
     else if (phase === "vote") panel = votePanel();
-    else if (phase === "over") panel = overPanel();
+    else if (phase === "over") panel = curtainPanel();
+
+    const playing = phase !== "lobby" && phase !== "over";
 
     app.innerHTML =
-      (error ? `<div class="notice">${esc(error)}</div>` : "") +
-      (phase === "lobby" || phase === "over" ? "" : banner()) +
+      (phase === "lobby" ? "" : topbar(sc)) +
+      notice +
       (phase === "lobby" ? "" : roleCard()) +
       panel +
-      (phase === "lobby" || phase === "over" ? "" : rosterCard()) +
-      (phase === "lobby" ? "" : logCard());
+      (playing ? findings() : "") +
+      (playing ? `<div class="panel"><h2>The company</h2>
+         ${castList(false)}</div>` : "") +
+      (phase === "lobby" ? "" : directions());
   }
 
-  // ------------------------------------------------------------------ input
+  /* --- Input -------------------------------------------------------------
+     Peek listeners live on window so a re-render mid-hold can never leave a
+     role stranded face-up. */
+
+  function setPeek(on) {
+    if (peeking === on) return;
+    peeking = on;
+    const el = document.querySelector(".card-hold");
+    if (el) el.classList.toggle("peeking", on);
+  }
+
+  app.addEventListener("pointerdown", (event) => {
+    if (event.target.closest(".card-hold")) { event.preventDefault(); setPeek(true); }
+  });
+  window.addEventListener("pointerup", () => setPeek(false));
+  window.addEventListener("pointercancel", () => setPeek(false));
+  window.addEventListener("blur", () => setPeek(false));
+
+  app.addEventListener("keydown", (event) => {
+    if ((event.key === " " || event.key === "Enter") && event.target.closest(".card-hold")) {
+      event.preventDefault();
+      setPeek(true);
+    }
+  });
+  window.addEventListener("keyup", () => setPeek(false));
 
   app.addEventListener("click", (event) => {
-    const el = event.target.closest("[data-act],[data-target],[data-vote],[data-reveal]");
+    const el = event.target.closest("[data-act],[data-target],[data-vote]");
     if (!el) return;
-
-    if (el.hasAttribute("data-reveal")) { roleVisible = true; return render(); }
 
     if (el.dataset.act === "join") {
       const name = (document.getElementById("name") || {}).value || "";
@@ -290,19 +382,23 @@
       return;
     }
     if (el.dataset.act === "start") return act("start");
-    if (el.dataset.act === "reset") { roleVisible = false; return act("reset"); }
+    if (el.dataset.act === "reset") { peeking = false; return act("reset"); }
     if (el.dataset.act === "ready") return act("ready", { ready: el.dataset.ready === "1" });
     if (el.dataset.target !== undefined) {
-      const t = el.dataset.target === "none" ? null : Number(el.dataset.target);
-      return act("night", { target: t });
+      return act("night", { target: el.dataset.target === "none" ? null : Number(el.dataset.target) });
     }
     if (el.dataset.vote !== undefined) {
-      const t = el.dataset.vote === "none" ? null : Number(el.dataset.vote);
-      return act("vote", { target: t });
+      return act("vote", { target: el.dataset.vote === "none" ? null : Number(el.dataset.vote) });
     }
   });
 
-  // Tick the countdown locally so it moves between server pushes.
+  app.addEventListener("keypress", (event) => {
+    if (event.key === "Enter" && event.target.id === "name") {
+      const button = app.querySelector('[data-act="join"]');
+      if (button) button.click();
+    }
+  });
+
   setInterval(() => {
     if (!state || !state.public.deadline) return;
     const el = document.querySelector(".clock");
