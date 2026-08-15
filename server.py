@@ -179,9 +179,23 @@ def lan_address():
         sock.close()
 
 
+def public_address(port):
+    """Where players should point their phones.
+
+    A managed host (Render, Railway, Fly) hands us the real URL through the
+    environment; on a laptop we work out the LAN address ourselves.
+    """
+    for var in ("RENDER_EXTERNAL_URL", "PUBLIC_URL"):
+        if os.environ.get(var):
+            return os.environ[var].rstrip("/"), True
+    return f"http://{lan_address()}:{port}", False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=8000)
+    # Managed hosts assign the port through $PORT and expect us to honour it.
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("PORT", 8000)))
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--night", type=int, default=90,
                         help="seconds for the night phase")
@@ -199,11 +213,13 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
 
-    address = f"http://{lan_address()}:{args.port}"
+    address, hosted = public_address(args.port)
     print("\n  Mafia — the computer is the host\n")
     print(f"  Players, on your phones:   {address}")
-    print(f"  Shared screen (this one):  {address}/table\n")
-    print("  Everyone must be on the same Wi-Fi. Ctrl-C to stop.\n")
+    print(f"  Shared screen:             {address}/table\n")
+    print("  Ctrl-C to stop.\n" if hosted
+          else "  Everyone must be on the same Wi-Fi. Ctrl-C to stop.\n")
+    sys.stdout.flush()
 
     try:
         server.serve_forever()
